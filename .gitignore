@@ -1,0 +1,23 @@
+# Python & Build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.dylib
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# IDE & Editor artifacts
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Temporary test binaries
+test_*
+*.out
+scratch/

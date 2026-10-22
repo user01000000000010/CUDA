@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lokal AI Hub - Llama 3.2</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --card-bg: #161b22;
+      --border: #30363d;
+      --accent: #58a6ff;
+      --text: #c9d1d9;
+      --text-bright: #ffffff;
+      --user-msg: #1f6feb;
+      --bot-msg: #21262d;
+    }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+    header {
+      background: var(--card-bg);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 24px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .badge {
+      background: #238636;
+      color: white;
+      font-size: 12px;
+      padding: 4px 8px;
+      border-radius: 12px;
+      font-weight: 600;
+    }
+    #chat-box {
+      flex: 1;
+      overflow-y: auto;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .message {
+      max-width: 80%;
+      padding: 12px 18px;
+      border-radius: 14px;
+      line-height: 1.5;
+      font-size: 15px;
+      word-wrap: break-word;
+    }
+    .user {
+      align-self: flex-end;
+      background: var(--user-msg);
+      color: white;
+      border-bottom-right-radius: 2px;
+    }
+    .bot {
+      align-self: flex-start;
+      background: var(--bot-msg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-bottom-left-radius: 2px;
+    }
+    #input-bar {
+      display: flex;
+      padding: 16px 24px;
+      background: var(--card-bg);
+      border-top: 1px solid var(--border);
+      gap: 12px;
+    }
+    input {
+      flex: 1;
+      background: #0d1117;
+      border: 1px solid var(--border);
+      color: white;
+      padding: 12px 16px;
+      border-radius: 8px;
+      font-size: 15px;
+      outline: none;
+    }
+    input:focus {
+      border-color: var(--accent);
+    }
+    button {
+      background: var(--accent);
+      color: #0d1117;
+      border: none;
+      padding: 12px 20px;
+      border-radius: 8px;
+      font-weight: 600;
+      cursor: pointer;
+      font-size: 15px;
+    }
+    button:hover {
+      opacity: 0.9;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <strong style="color: var(--text-bright); font-size: 18px;">Lokal Llama 3.2</strong>
+      <span style="font-size: 13px; color: #8b949e; margin-left: 8px;">(Ollama Private Node)</span>
+    </div>
+    <span class="badge">100% Gratis & Lokal</span>
+  </header>
+
+  <div id="chat-box">
+    <div class="message bot">
+      Hej! Jag körs helt lokalt på din Mac via Ollama och Llama 3.2. Ingen data skickas över internet och det kostar 0 kr. Vad vill du ha hjälp med?
+    </div>
+  </div>
+
+  <form id="input-bar" onsubmit="sendMessage(event)">
+    <input type="text" id="prompt-input" placeholder="Skriv ett meddelande till din lokala Llama..." autocomplete="off">
+    <button type="submit" id="send-btn">Skicka</button>
+  </form>
+
+  <script>
+    const chatBox = document.getElementById('chat-box');
+    const input = document.getElementById('prompt-input');
+    const btn = document.getElementById('send-btn');
+
+    async function sendMessage(e) {
+      e.preventDefault();
+      const text = input.value.trim();
+      if (!text) return;
+
+      // Add user message
+      appendMsg(text, 'user');
+      input.value = '';
+      btn.disabled = true;
+
+      // Create bot placeholder
+      const botMsg = appendMsg('...', 'bot');
+
+      try {
+        const response = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'llama3.2:latest',
+            prompt: text,
+            stream: true
+          })
+        });
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        botMsg.innerText = '';
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop(); // keep partial trailing line
+
+          for (let l of lines) {
+            l = l.trim();
+            if (!l) continue;
+            try {
+              const data = JSON.parse(l);
+              botMsg.innerText += (data.response || '');
+              chatBox.scrollTop = chatBox.scrollHeight;
+            } catch (e) {
+              console.error('JSON parse error:', e, l);
+            }
+          }
+        }
+      } catch (err) {
+        botMsg.innerText = 'Fel vid anslutning till lokal Ollama: ' + err.message;
+      } finally {
+        btn.disabled = false;
+        input.focus();
+      }
+    }
+
+    function appendMsg(text, sender) {
+      const div = document.createElement('div');
+      div.className = `message ${sender}`;
+      div.innerText = text;
+      chatBox.appendChild(div);
+      chatBox.scrollTop = chatBox.scrollHeight;
+      return div;
+    }
+  </script>
+</body>
+</html>

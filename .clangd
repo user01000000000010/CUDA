@@ -1,0 +1,17 @@
+CompileFlags:
+  Add:
+    - -std=c++17
+    - -Wno-unknown-attributes
+    - -Wno-unknown-pragmas
+    - -Wno-unused-variable
+    - -Wno-unused-function
+    - -I/Users/axa/Library/CloudStorage/GoogleDrive-user01000000000010@gmail.com/My Drive/CUDA
+    - -I/Users/axa/Library/Python/3.9/lib/python/site-packages/torch/include
+    - -I/Users/axa/Library/Python/3.9/lib/python/site-packages/torch/include/torch/csrc/api/include
+    - -D__CUDA_ARCH__=800
+
+Diagnostics:
+  Suppress:
+    - fatal_too_many_errors
+    - unknown_typename
+    - undeclared_var_use
