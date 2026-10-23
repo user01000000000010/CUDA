@@ -1,0 +1,76 @@
+name: CUDA Kernel Verification & Regression Suite
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-verify:
+    name: Build & Hardware Audit (GPU Self-Hosted)
+    # Använd self-hosted GPU-runner (t.ex. med Ampere, Ada eller Hopper GPU)
+    # Vid standard GitHub runner utan GPU körs bygge och CPU-validering
+    runs-on: [self-hosted, gpu]
+
+    env:
+      CUDA_HOME: /usr/local/cuda
+      TORCH_CUDA_ARCH_LIST: "8.0;8.6;8.9;9.0"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Check GPU & Environment
+        run: |
+          nvidia-smi
+          nvcc --version
+          which compute-sanitizer || echo "compute-sanitizer saknas i standard PATH"
+          which ncu || echo "ncu saknas i standard PATH"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cu121
+          pip install pytest numpy ninja tabulate
+
+      - name: Build CUDA Extensions
+        run: |
+          chmod +x scripts/build.sh
+          ./scripts/build.sh
+
+      - name: Run PyTest Suite (Functional & Numerical Accuracy)
+        run: |
+          pytest tests/ -v --durations=10
+
+      - name: Run Compute Sanitizer & Profiling Engine
+        id: audit
+        run: |
+          chmod +x run_gpu_audit.sh cuda_audit_engine.py
+          ./run_gpu_audit.sh --report CUDA_AUDIT_REPORT.md
+
+      - name: Post Audit Report to Step Summary
+        if: always()
+        run: |
+          if [ -f CUDA_AUDIT_REPORT.md ]; then
+            cat CUDA_AUDIT_REPORT.md >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload Profiling Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuda-audit-report
+          path: |
+            CUDA_AUDIT_REPORT.md
