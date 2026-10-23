@@ -1,17 +1,12 @@
-#include "async_flash_decode_kernel.cuh"
-#include "cuda_compat.h"
-#include "flash_attention_bwd_kernel.cuh"
-#include "flash_attention_v2_kernel.cuh"
-#include "flash_attention_v3_hopper_kernel.cuh"
-#include "fp8_paged_attention_kernel.cuh"
-#include "fused_gqa_kernel.cuh"
-#include "fused_mla_kernel.cuh"
-#include "fused_online_softmax_kernel.cuh"
-#include "fused_rope_flash_attention_kernel.cuh"
-#include "fused_transformer_megablock.cuh"
-#include "paged_attention_kernel.cuh"
+// Host-compiled binding: include ONLY declarations (see kernels_api.h).
+// Each kernel is compiled in only when setup.py defines WITH_<KERNEL>.
+#include <ATen/cuda/CUDAContext.h>
+#include <cmath>
 #include <torch/extension.h>
 
+#include "kernels_api.h"
+
+#ifdef WITH_SOFTMAX
 // PyTorch bindings for Fused Online Softmax
 torch::Tensor fused_online_softmax_forward(torch::Tensor input) {
   TORCH_CHECK(input.is_cuda(), "Input tensor must be on CUDA device");
@@ -47,6 +42,9 @@ torch::Tensor fused_online_softmax_forward(torch::Tensor input) {
   return output;
 }
 
+#endif // WITH_SOFTMAX
+
+#ifdef WITH_FA2
 // PyTorch bindings for FlashAttention-2 Forward
 torch::Tensor flash_attention_v2_forward(
     torch::Tensor q, torch::Tensor k, torch::Tensor v, bool is_causal = false,
@@ -104,6 +102,9 @@ torch::Tensor flash_attention_v2_forward(
   return output;
 }
 
+#endif // WITH_FA2
+
+#ifdef WITH_PAGED
 // PyTorch bindings for PagedAttention (vLLM style Virtual Memory Paging)
 torch::Tensor paged_attention_forward(
     torch::Tensor query,        // [num_seqs, num_heads, head_dim]
@@ -171,6 +172,9 @@ torch::Tensor paged_attention_forward(
   return output;
 }
 
+#endif // WITH_PAGED
+
+#ifdef WITH_ROPE
 // PyTorch bindings for Fused RoPE & FlashAttention-2 (Llama-3 Architecture)
 torch::Tensor fused_rope_flash_attention_forward(
     torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor cos_tab,
@@ -235,6 +239,9 @@ torch::Tensor fused_rope_flash_attention_forward(
   return output;
 }
 
+#endif // WITH_ROPE
+
+#ifdef WITH_GQA
 // PyTorch bindings for Grouped-Query Attention (GQA)
 torch::Tensor
 fused_gqa_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v,
@@ -294,6 +301,9 @@ fused_gqa_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v,
   return output;
 }
 
+#endif // WITH_GQA
+
+#ifdef WITH_DECODE
 // PyTorch bindings for Asynchronous Double-Buffered Flash-Decoding
 torch::Tensor async_flash_decode_forward(
     torch::Tensor q, torch::Tensor k, torch::Tensor v,
@@ -349,6 +359,9 @@ torch::Tensor async_flash_decode_forward(
   return output;
 }
 
+#endif // WITH_DECODE
+
+#ifdef WITH_BWD
 // PyTorch bindings for FlashAttention-2 Backward Pass (Exact autograd
 // gradients)
 std::vector<torch::Tensor> flash_attention_v2_backward_forward(
@@ -419,6 +432,9 @@ std::vector<torch::Tensor> flash_attention_v2_backward_forward(
   return {dq, dk, dv};
 }
 
+#endif // WITH_BWD
+
+#ifdef WITH_MLA
 // PyTorch bindings for Multi-Head Latent Attention (DeepSeek-V2/V3 MLA)
 torch::Tensor
 fused_mla_forward(torch::Tensor q, // [batch, num_heads, seq_len, head_dim]
@@ -485,6 +501,9 @@ fused_mla_forward(torch::Tensor q, // [batch, num_heads, seq_len, head_dim]
   return output;
 }
 
+#endif // WITH_MLA
+
+#ifdef WITH_FA3
 // PyTorch bindings for FlashAttention-3 Hopper (Warp-Specialized Architecture)
 torch::Tensor flash_attention_v3_hopper_forward(
     torch::Tensor q, torch::Tensor k, torch::Tensor v, bool is_causal = false,
@@ -540,6 +559,9 @@ torch::Tensor flash_attention_v3_hopper_forward(
   return output;
 }
 
+#endif // WITH_FA3
+
+#ifdef WITH_MEGABLOCK
 // PyTorch bindings for The Fully-Fused Llama-3 Transformer MegaBlock
 torch::Tensor fused_llama_megablock_forward(
     torch::Tensor x, torch::Tensor rms_weight1, torch::Tensor rms_weight2,
@@ -604,6 +626,9 @@ torch::Tensor fused_llama_megablock_forward(
   return output;
 }
 
+#endif // WITH_MEGABLOCK
+
+#ifdef WITH_FP8_PAGED
 // PyTorch bindings for Quantized FP8 PagedAttention (vLLM style extreme memory
 // compression)
 torch::Tensor fp8_paged_attention_forward(
@@ -691,15 +716,21 @@ torch::Tensor fp8_paged_attention_forward(
 
   return output;
 }
+#endif // WITH_FP8_PAGED
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+#ifdef WITH_SOFTMAX
   m.def("forward", &fused_online_softmax_forward,
         "Fused Online Softmax forward (CUDA)");
+#endif
+#ifdef WITH_FA2
   m.def("flash_attention_forward", &flash_attention_v2_forward,
         "FlashAttention-2 Forward with Online Softmax and SRAM Tiling (CUDA)",
         pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("v"),
         pybind11::arg("is_causal") = false,
         pybind11::arg("softmax_scale") = pybind11::none());
+#endif
+#ifdef WITH_PAGED
   m.def(
       "paged_attention_forward", &paged_attention_forward,
       "PagedAttention Forward (vLLM style virtual memory paging for KV cache)",
@@ -707,6 +738,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       pybind11::arg("value_cache"), pybind11::arg("block_tables"),
       pybind11::arg("context_lens"),
       pybind11::arg("softmax_scale") = pybind11::none());
+#endif
+#ifdef WITH_ROPE
   m.def("fused_rope_flash_attention", &fused_rope_flash_attention_forward,
         "Fused RoPE + FlashAttention-2 (Llama-3 Architecture with in-SRAM "
         "rotary embedding)",
@@ -714,22 +747,30 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("cos_tab"), pybind11::arg("sin_tab"),
         pybind11::arg("is_causal") = true,
         pybind11::arg("softmax_scale") = pybind11::none());
+#endif
+#ifdef WITH_GQA
   m.def("fused_gqa_forward", &fused_gqa_forward,
         "Grouped-Query Attention (GQA) Forward with dynamic head-broadcasting",
         pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("v"),
         pybind11::arg("is_causal") = true,
         pybind11::arg("softmax_scale") = pybind11::none());
+#endif
+#ifdef WITH_DECODE
   m.def("async_flash_decode", &async_flash_decode_forward,
         "Asynchronous Double-Buffered Flash-Decoding with XOR Shared Memory "
         "Swizzling",
         pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("v"),
         pybind11::arg("softmax_scale") = pybind11::none());
+#endif
+#ifdef WITH_BWD
   m.def("flash_attention_backward", &flash_attention_v2_backward_forward,
         "FlashAttention-2 Backward Pass with SRAM Recomputation",
         pybind11::arg("dout"), pybind11::arg("q"), pybind11::arg("k"),
         pybind11::arg("v"), pybind11::arg("out"), pybind11::arg("lse"),
         pybind11::arg("is_causal") = false,
         pybind11::arg("softmax_scale") = pybind11::none());
+#endif
+#ifdef WITH_MLA
   m.def("fused_mla_forward", &fused_mla_forward,
         "Multi-Head Latent Attention (DeepSeek-V2/V3 MLA with compressed KV "
         "cache)",
@@ -737,11 +778,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("w_uk"), pybind11::arg("w_uv"),
         pybind11::arg("is_causal") = true,
         pybind11::arg("softmax_scale") = pybind11::none());
+#endif
+#ifdef WITH_FA3
   m.def("flash_attention_v3_hopper", &flash_attention_v3_hopper_forward,
         "FlashAttention-3 Hopper TMA & Warp-Specialized Forward Kernel (sm_90)",
         pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("v"),
         pybind11::arg("is_causal") = false,
         pybind11::arg("softmax_scale") = pybind11::none());
+#endif
+#ifdef WITH_MEGABLOCK
   m.def("fused_llama_megablock", &fused_llama_megablock_forward,
         "The Fully-Fused Llama-3 Transformer MegaBlock (RMSNorm + RoPE + GQA + "
         "SwiGLU FFN in SRAM)",
@@ -750,6 +795,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("sin_tab"), pybind11::arg("eps") = 1e-6,
         pybind11::arg("softmax_scale") = pybind11::none(),
         pybind11::arg("is_causal") = true);
+#endif
+#ifdef WITH_FP8_PAGED
   m.def("fp8_paged_attention_forward", &fp8_paged_attention_forward,
         "FP8 Quantized PagedAttention Forward (50-75% KV-cache memory "
         "reduction with in-SRAM dequantization)",
@@ -758,4 +805,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("v_scale"), pybind11::arg("block_tables"),
         pybind11::arg("context_lens"),
         pybind11::arg("softmax_scale") = pybind11::none());
+#endif
 }

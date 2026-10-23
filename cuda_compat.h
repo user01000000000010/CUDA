@@ -4,11 +4,40 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <cuda_fp16.h>
-#if __CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__)
 #include <cuda_bf16.h>
-#endif
 #include <math_constants.h>
 #define CUDA_KERNEL_LAUNCH(fn, grid, block, smem, stream, ...) fn<<<grid, block, smem, stream>>>(__VA_ARGS__)
+
+// ============================================================================
+// Scalar type conversion helpers (device + host)
+// Previously only defined in the host-stub branch below, which made every
+// kernel that uses them fail to compile under nvcc.
+// ============================================================================
+template <typename T>
+__host__ __device__ __forceinline__ float to_float(T val) {
+    return static_cast<float>(val);
+}
+template <>
+__host__ __device__ __forceinline__ float to_float<__half>(__half val) {
+    return __half2float(val);
+}
+template <>
+__host__ __device__ __forceinline__ float to_float<__nv_bfloat16>(__nv_bfloat16 val) {
+    return __bfloat162float(val);
+}
+
+template <typename T>
+__host__ __device__ __forceinline__ T from_float(float val) {
+    return static_cast<T>(val);
+}
+template <>
+__host__ __device__ __forceinline__ __half from_float<__half>(float val) {
+    return __float2half(val);
+}
+template <>
+__host__ __device__ __forceinline__ __nv_bfloat16 from_float<__nv_bfloat16>(float val) {
+    return __float2bfloat16(val);
+}
 
 // ============================================================================
 // Modern CUDA Block/Tensor & Asynchronous Pipeline Primitives

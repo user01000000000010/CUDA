@@ -17,7 +17,22 @@ dist/
 *.swp
 *.swo
 
-# Temporary test binaries
-test_*
+# Temporary test binaries (repo root only – keep tests/test_*.py tracked)
+/test_*
 *.out
 scratch/
+
+# CUDA / profiling artifacts
+*.o
+*.obj
+*.cubin
+*.fatbin
+*.ptx
+*.sass
+*.ncu-rep
+*.nsys-rep
+.ninja_deps
+.ninja_log
+build.ninja
+sass_reports/
+.pytest_cache/
