@@ -17,6 +17,7 @@
 // ============================================================================
 
 template <typename T, int Br = 64, int Bc = 64, int D = 64>
+__launch_bounds__(128, 2)
 __global__ void fused_rope_flash_attention_kernel(
     const T* __restrict__ Q,          // [batch, num_heads, seq_len, D]
     const T* __restrict__ K,          // [batch, num_heads, seq_len, D]

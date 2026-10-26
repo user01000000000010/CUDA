@@ -1,6 +1,7 @@
 #pragma once
 #include "cuda_compat.h"
 #include "tile_ir.cuh"
+#include "autotune.cuh"
 #include <cstdint>
 #include <algorithm>
 
@@ -17,7 +18,8 @@
 // 3. Online Softmax in FP32 registers.
 // ============================================================================
 
-template <typename T, int Br = 64, int Bc = 64, int D = 64>
+template <typename T, int Br = 64, int Bc = 64, int D = 64, int NUM_THREADS = 128>
+__launch_bounds__(NUM_THREADS, 2)
 __global__ void flash_attention_v2_fwd_kernel(
     const T* __restrict__ Q,      // [batch, num_heads, seq_len, D]
     const T* __restrict__ K,      // [batch, num_heads, seq_len, D]
@@ -31,7 +33,6 @@ __global__ void flash_attention_v2_fwd_kernel(
     const int head_idx = blockIdx.y;
     const int batch_idx = blockIdx.z;
     const int tid = threadIdx.x;
-    constexpr int NUM_THREADS = 128;
 
     // Strides
     const size_t bh_offset = (static_cast<size_t>(batch_idx) * gridDim.y + head_idx) * (static_cast<size_t>(seq_len) * D);
@@ -92,11 +93,16 @@ __global__ void flash_attention_v2_fwd_kernel(
             const int c = idx % D;
             const int cur_kv_row = kv_col_start + r;
             if (cur_kv_row < seq_len) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && !defined(__CUDACC_RTC__)
+                cp_async_16(&s_K_data[stage_idx][idx], &k_ptr[static_cast<size_t>(cur_kv_row) * D + c]);
+                cp_async_16(&s_V_data[stage_idx][idx], &v_ptr[static_cast<size_t>(cur_kv_row) * D + c]);
+#else
                 #pragma unroll
                 for (int k = 0; k < 4; ++k) {
                     s_K(r, c + k) = to_float(k_ptr[static_cast<size_t>(cur_kv_row) * D + (c + k)]);
                     s_V(r, c + k) = to_float(v_ptr[static_cast<size_t>(cur_kv_row) * D + (c + k)]);
                 }
+#endif
             } else {
                 #pragma unroll
                 for (int k = 0; k < 4; ++k) {
@@ -135,12 +141,12 @@ __global__ void flash_attention_v2_fwd_kernel(
             float S_row[Bc];
             float block_row_max = -CUDART_INF_F;
 
-            #pragma unroll 4
-            for (int j = 0; j < Bc; ++j) {
-                const int global_k_col = kv_col_start + j;
-                if (global_k_col >= seq_len || (is_causal && global_k_col > global_q_row)) {
-                    S_row[j] = -CUDART_INF_F;
-                } else {
+            const bool is_fully_unmasked = (!is_causal || (kv_col_start + Bc <= global_q_row)) && (kv_col_start + Bc <= seq_len);
+
+            if (is_fully_unmasked) {
+                // Fast-path: Completely unmasked tile. Zero conditionals, full instruction-level parallelism
+                #pragma unroll 4
+                for (int j = 0; j < Bc; ++j) {
                     float dot = 0.0f;
                     #pragma unroll 8
                     for (int d = 0; d < D; ++d) {
@@ -149,6 +155,24 @@ __global__ void flash_attention_v2_fwd_kernel(
                     float scaled_dot = dot * softmax_scale;
                     S_row[j] = scaled_dot;
                     block_row_max = fmaxf(block_row_max, scaled_dot);
+                }
+            } else {
+                // Boundary-path: Causal diagonal or sequence boundary
+                #pragma unroll 4
+                for (int j = 0; j < Bc; ++j) {
+                    const int global_k_col = kv_col_start + j;
+                    if (global_k_col >= seq_len || (is_causal && global_k_col > global_q_row)) {
+                        S_row[j] = -CUDART_INF_F;
+                    } else {
+                        float dot = 0.0f;
+                        #pragma unroll 8
+                        for (int d = 0; d < D; ++d) {
+                            dot += s_Q(local_row, d) * s_K(j, d);
+                        }
+                        float scaled_dot = dot * softmax_scale;
+                        S_row[j] = scaled_dot;
+                        block_row_max = fmaxf(block_row_max, scaled_dot);
+                    }
                 }
             }
 
@@ -205,7 +229,7 @@ __global__ void flash_attention_v2_fwd_kernel(
     }
 }
 
-// Host Dispatcher
+// Host Dispatcher with Adaptive Silicon-Level Dynamic Autotuning
 template <typename T>
 void dispatch_flash_attention_v2(
     const T* q,
@@ -220,23 +244,61 @@ void dispatch_flash_attention_v2(
     bool is_causal,
     cudaStream_t stream = nullptr)
 {
-    constexpr int Br = 64;
-    constexpr int Bc = 64;
-    constexpr int NUM_THREADS = 128;
+    auto policy = autotune::select_attention_tile_policy(seq_len, head_dim, num_heads, batch_size);
 
-    const int num_q_blocks = (seq_len + Br - 1) / Br;
-    dim3 grid(num_q_blocks, num_heads, batch_size);
-    dim3 block(NUM_THREADS);
-
-    if (head_dim == 64) {
-        CUDA_KERNEL_LAUNCH(
-            (flash_attention_v2_fwd_kernel<T, Br, Bc, 64>),
-            grid, block, 0, stream,
-            q, k, v, o, seq_len, softmax_scale, is_causal);
-    } else if (head_dim == 128) {
-        CUDA_KERNEL_LAUNCH(
-            (flash_attention_v2_fwd_kernel<T, Br, Bc, 128>),
-            grid, block, 0, stream,
-            q, k, v, o, seq_len, softmax_scale, is_causal);
+    if (policy.Br == 32) {
+        constexpr int Br = 32;
+        constexpr int Bc = 64;
+        constexpr int NUM_THREADS = 64;
+        const int num_q_blocks = (seq_len + Br - 1) / Br;
+        dim3 grid(num_q_blocks, num_heads, batch_size);
+        dim3 block(NUM_THREADS);
+        if (head_dim == 64) {
+            CUDA_KERNEL_LAUNCH(
+                (flash_attention_v2_fwd_kernel<T, Br, Bc, 64, NUM_THREADS>),
+                grid, block, 0, stream,
+                q, k, v, o, seq_len, softmax_scale, is_causal);
+        } else {
+            CUDA_KERNEL_LAUNCH(
+                (flash_attention_v2_fwd_kernel<T, Br, Bc, 128, NUM_THREADS>),
+                grid, block, 0, stream,
+                q, k, v, o, seq_len, softmax_scale, is_causal);
+        }
+    } else if (policy.Br == 128) {
+        constexpr int Br = 128;
+        constexpr int Bc = 64;
+        constexpr int NUM_THREADS = 256;
+        const int num_q_blocks = (seq_len + Br - 1) / Br;
+        dim3 grid(num_q_blocks, num_heads, batch_size);
+        dim3 block(NUM_THREADS);
+        if (head_dim == 64) {
+            CUDA_KERNEL_LAUNCH(
+                (flash_attention_v2_fwd_kernel<T, Br, Bc, 64, NUM_THREADS>),
+                grid, block, 0, stream,
+                q, k, v, o, seq_len, softmax_scale, is_causal);
+        } else {
+            CUDA_KERNEL_LAUNCH(
+                (flash_attention_v2_fwd_kernel<T, Br, Bc, 128, NUM_THREADS>),
+                grid, block, 0, stream,
+                q, k, v, o, seq_len, softmax_scale, is_causal);
+        }
+    } else {
+        constexpr int Br = 64;
+        constexpr int Bc = 64;
+        constexpr int NUM_THREADS = 128;
+        const int num_q_blocks = (seq_len + Br - 1) / Br;
+        dim3 grid(num_q_blocks, num_heads, batch_size);
+        dim3 block(NUM_THREADS);
+        if (head_dim == 64) {
+            CUDA_KERNEL_LAUNCH(
+                (flash_attention_v2_fwd_kernel<T, Br, Bc, 64, NUM_THREADS>),
+                grid, block, 0, stream,
+                q, k, v, o, seq_len, softmax_scale, is_causal);
+        } else {
+            CUDA_KERNEL_LAUNCH(
+                (flash_attention_v2_fwd_kernel<T, Br, Bc, 128, NUM_THREADS>),
+                grid, block, 0, stream,
+                q, k, v, o, seq_len, softmax_scale, is_causal);
+        }
     }
 }

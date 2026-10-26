@@ -20,6 +20,7 @@
 // ============================================================================
 
 template <typename T, int Br = 64, int Bc = 64, int D = 64, int LATENT_DIM = 64>
+__launch_bounds__(128, 2)
 __global__ void fused_mla_forward_kernel(
     const T* __restrict__ Q,              // [batch, num_heads, seq_len, D]
     const T* __restrict__ Compressed_KV,  // [batch, seq_len, LATENT_DIM]
@@ -91,12 +92,27 @@ __global__ void fused_mla_forward_kernel(
     }
     __syncthreads();
 
-    // Register accumulator state
-    float acc_O[D];
+    // Register accumulator state in latent space (huge complexity reduction)
+    float acc_latent[LATENT_DIM];
     #pragma unroll
-    for (int d = 0; d < D; ++d) {
-        acc_O[d] = 0.0f;
+    for (int l = 0; l < LATENT_DIM; ++l) {
+        acc_latent[l] = 0.0f;
     }
+
+    // Precompute Q projection onto latent space: Q_proj = Q * W_UK
+    float q_proj[LATENT_DIM];
+    if (local_row < Br && global_q_row < seq_len) {
+        #pragma unroll 4
+        for (int l = 0; l < LATENT_DIM; ++l) {
+            float sum = 0.0f;
+            #pragma unroll 8
+            for (int d = 0; d < D; ++d) {
+                sum += s_Q(local_row, d) * s_W_UK(d, l);
+            }
+            q_proj[l] = sum;
+        }
+    }
+
     float m_i = -CUDART_INF_F;
     float l_i = 0.0f;
 
@@ -114,10 +130,14 @@ __global__ void fused_mla_forward_kernel(
             const int cur_kv_row = kv_col_start + r;
 
             if (cur_kv_row < seq_len) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && !defined(__CUDACC_RTC__)
+                cp_async_16(&s_CKV_data[stage_idx][idx], &ckv_ptr[static_cast<size_t>(cur_kv_row) * LATENT_DIM + c]);
+#else
                 #pragma unroll
                 for (int k = 0; k < 4; ++k) {
                     s_CKV(r, c + k) = to_float(ckv_ptr[static_cast<size_t>(cur_kv_row) * LATENT_DIM + (c + k)]);
                 }
+#endif
             } else {
                 #pragma unroll
                 for (int k = 0; k < 4; ++k) {
@@ -158,15 +178,11 @@ __global__ void fused_mla_forward_kernel(
                 if (global_k_col >= seq_len || (is_causal && global_k_col > global_q_row)) {
                     S_row[j] = -CUDART_INF_F;
                 } else {
+                    // Pre-projected Q_proj * C_KV: O(LATENT_DIM) instead of O(D * LATENT_DIM)
                     float dot = 0.0f;
-                    #pragma unroll 4
-                    for (int d = 0; d < D; ++d) {
-                        float k_d = 0.0f;
-                        #pragma unroll 8
-                        for (int l = 0; l < LATENT_DIM; ++l) {
-                            k_d += s_CKV(j, l) * s_W_UK(d, l);
-                        }
-                        dot += s_Q(local_row, d) * k_d;
+                    #pragma unroll 8
+                    for (int l = 0; l < LATENT_DIM; ++l) {
+                        dot += q_proj[l] * s_CKV(j, l);
                     }
                     float scaled = dot * softmax_scale;
                     S_row[j] = scaled;
@@ -193,21 +209,15 @@ __global__ void fused_mla_forward_kernel(
 
             const float l_new = alpha * l_i + block_sum_exp;
 
+            // Accumulate into latent space directly: O(Bc * LATENT_DIM)
             #pragma unroll 4
-            for (int d = 0; d < D; ++d) {
-                float pv = 0.0f;
+            for (int l = 0; l < LATENT_DIM; ++l) {
+                float pl = 0.0f;
                 #pragma unroll 4
                 for (int j = 0; j < Bc; ++j) {
-                    if (P_row[j] > 0.0f) {
-                        float v_d = 0.0f;
-                        #pragma unroll 8
-                        for (int l = 0; l < LATENT_DIM; ++l) {
-                            v_d += s_CKV(j, l) * s_W_UV(d, l);
-                        }
-                        pv += P_row[j] * v_d;
-                    }
+                    pl += P_row[j] * s_CKV(j, l);
                 }
-                acc_O[d] = alpha * acc_O[d] + pv;
+                acc_latent[l] = alpha * acc_latent[l] + pl;
             }
 
             m_i = m_new;
@@ -221,13 +231,17 @@ __global__ void fused_mla_forward_kernel(
         curr_stage = next_stage;
     }
 
-    // 4. Final normalization and store output: O = acc_O / l_i
+    // 4. Final normalization and project back from latent space to head_dim: O = (acc_latent / l_i) * W_UV^T
     if (local_row < Br && global_q_row < seq_len) {
         const float inv_l = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;
         #pragma unroll 4
         for (int d = 0; d < D; ++d) {
-            float final_val = acc_O[d] * inv_l;
-            o_ptr[static_cast<size_t>(global_q_row) * D + d] = from_float<T>(final_val);
+            float out_d = 0.0f;
+            #pragma unroll 8
+            for (int l = 0; l < LATENT_DIM; ++l) {
+                out_d += (acc_latent[l] * inv_l) * s_W_UV(d, l);
+            }
+            o_ptr[static_cast<size_t>(global_q_row) * D + d] = from_float<T>(out_d);
         }
     }
 }

@@ -22,6 +22,7 @@
 // ============================================================================
 
 template <typename T, int Br = 64, int Bc = 64, int D = 64>
+__launch_bounds__(128, 2)
 __global__ void flash_attention_v2_bwd_kernel(
     const T* __restrict__ Q,          // [batch, num_heads, seq_len, D]
     const T* __restrict__ K,          // [batch, num_heads, seq_len, D]
@@ -171,6 +172,20 @@ __global__ void flash_attention_v2_bwd_kernel(
                 }
                 acc_dQ[d] += sum_dsk;
             }
+
+            // Accumulate dV = P^T * dO and dK = dS^T * Q into global memory
+            for (int j = 0; j < Bc; ++j) {
+                const int global_k_col = kv_col_start + j;
+                if (global_k_col < seq_len && (!is_causal || global_k_col <= global_q_row)) {
+                    #pragma unroll 4
+                    for (int d = 0; d < D; ++d) {
+                        float dv_elem = P_row[j] * s_dO[local_row][d];
+                        float dk_elem = dS_row[j] * s_Q[local_row][d];
+                        atomicAdd(&dv_ptr[static_cast<size_t>(global_k_col) * D + d], from_float<T>(dv_elem));
+                        atomicAdd(&dk_ptr[static_cast<size_t>(global_k_col) * D + d], from_float<T>(dk_elem));
+                    }
+                }
+            }
         }
 
         __syncthreads();
@@ -208,6 +223,10 @@ void dispatch_flash_attention_v2_backward(
     constexpr int Br = 64;
     constexpr int Bc = 64;
     constexpr int NUM_THREADS = 128;
+
+    const size_t total_elements = static_cast<size_t>(batch_size) * num_heads * seq_len * head_dim;
+    cudaMemsetAsync(dk, 0, total_elements * sizeof(T), stream);
+    cudaMemsetAsync(dv, 0, total_elements * sizeof(T), stream);
 
     const int num_q_blocks = (seq_len + Br - 1) / Br;
     dim3 grid(num_q_blocks, num_heads, batch_size);

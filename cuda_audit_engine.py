@@ -62,16 +62,16 @@ class KernelProfile:
         return self.bank_conflicts_ld + self.bank_conflicts_st
 
     def evaluate_grade(self) -> str:
-        """Utvärderar kärnan mot 10/10-kriterier."""
+        """Utvärderar kärnan mot 100/100 och 10/10 silicon-effektivitetskriterier."""
         if self.spills > 0:
-            return "VARNING (Register Spilling)"
+            return "VARNING (Register Spilling detekterat)"
         if self.max_sol >= 80.0 and self.total_bank_conflicts == 0:
-            return "10/10 (Optimal SOL & Konfliktfri)"
+            return "100/100 (10/10 - Optimal Speed-of-Light & Fulländad Silicon-effektivitet)"
         if self.max_sol >= 70.0:
-            return "9/10 (Hög SOL)"
+            return "90/100 (9/10 - Hög SOL)"
         if self.max_sol >= 50.0:
-            return "8/10 (Godkänd, kan optimeras)"
-        return "Under 8/10 (Flaskhals detekterad)"
+            return "80/100 (8/10 - Godkänd)"
+        return "Under 80/100 (Flaskhals detekterad)"
 
 
 def run_compute_sanitizer(target_cmd: List[str], tools: List[str]) -> List[SanitizerResult]:
@@ -110,7 +110,7 @@ def parse_float(val: str) -> float:
         return 0.0
 
 
-def run_ncu_profiler(target_cmd: List[str], kernel_regex: str, launch_skip: int, launch_count: int) -> List[KernelProfile]:
+def run_ncu_profiler(target_cmd: List[str], kernel_regex: str, launch_skip: int, launch_count: int, export_rep: str = "") -> List[KernelProfile]:
     print(f"[*] Kör Nsight Compute (ncu) med {len(NCU_METRICS)} hårdvarumätetal ...")
     cmd = [
         "ncu",
@@ -121,8 +121,11 @@ def run_ncu_profiler(target_cmd: List[str], kernel_regex: str, launch_skip: int,
         "--launch-count", str(launch_count),
         "--metrics", ",".join(NCU_METRICS),
         "--clock-control", "base",
-        *target_cmd,
     ]
+    if export_rep:
+        os.makedirs(os.path.dirname(export_rep) or ".", exist_ok=True)
+        cmd.extend(["--export", export_rep, "--force-overwrite"])
+    cmd.extend(target_cmd)
 
     proc = subprocess.run(cmd, capture_output=True, text=True)
     raw_output = proc.stdout
@@ -259,6 +262,7 @@ def main():
     parser.add_argument("--launch-skip", type=int, default=5, help="Antal warmup-launches att hoppa över per kärna")
     parser.add_argument("--launch-count", type=int, default=10, help="Antal kärnstarter att profilera")
     parser.add_argument("--report", default="CUDA_AUDIT_REPORT.md", help="Sökväg för genererad Markdown-rapport")
+    parser.add_argument("--export-ncu", default="ncu_reports/cuda_audit_profile", help="Exportera .ncu-rep rapport för Nsight Compute GUI")
     parser.add_argument("--skip-sanitizer", action="store_true", help="Hoppa över compute-sanitizer")
     args = parser.parse_args()
 
@@ -275,6 +279,7 @@ def main():
         kernel_regex=args.kernel_regex,
         launch_skip=args.launch_skip,
         launch_count=args.launch_count,
+        export_rep=args.export_ncu,
     )
 
     generate_markdown_report(sanitizer_results, profiles, args.report)

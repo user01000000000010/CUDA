@@ -14,9 +14,13 @@
 // NOTE: no default arguments here – the binding always passes the stream.
 // ============================================================================
 #include <cstdint>
+#if defined(__has_include) && __has_include(<cuda_runtime_api.h>)
 #include <cuda_runtime_api.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#else
+#include "cuda_compat.h"
+#endif
 
 template <typename T>
 void dispatch_fused_online_softmax(const T* input, T* output, int batch_size,
@@ -95,3 +99,11 @@ void dispatch_fp8_paged_attention(
     int num_seqs, int num_heads, int head_dim, int max_blocks_per_seq,
     int page_size, float softmax_scale, bool per_block_scales,
     cudaStream_t stream);
+
+template <typename T_OUT>
+void dispatch_fused_microscaled_attention(
+    const int8_t* q, const float* q_scale, const int8_t* k, const float* k_scale,
+    const int8_t* v, const float* v_scale, T_OUT* out,
+    int batch_size, int num_heads, int seq_len, int head_dim,
+    float softmax_scale, bool is_causal, cudaStream_t stream);
+

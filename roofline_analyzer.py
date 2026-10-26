@@ -216,12 +216,13 @@ def main():
     specs = get_gpu_specs(args.gpu)
 
     # Exempelberäkningar baserade på standarddimensioner för dina kernels (B=4, H=32, S=4096, D=128)
+    # H100 SXM (peak_bw = 3350 GB/s): theoretical_max = (intensity * 3350) / 1000
     sample_measurements = [
-        KernelMeasurement(name="flash_attention_v2_fwd", arithmetic_intensity=64.0, achieved_tflops=245.0, achieved_bw_gbs=1850.0),
-        KernelMeasurement(name="flash_attention_v3_hopper", arithmetic_intensity=85.3, achieved_tflops=278.0, achieved_bw_gbs=1920.0),
-        KernelMeasurement(name="fused_online_softmax", arithmetic_intensity=2.0, achieved_tflops=3.8, achieved_bw_gbs=1910.0),
-        KernelMeasurement(name="paged_attention_fp8", arithmetic_intensity=16.0, achieved_tflops=31.2, achieved_bw_gbs=1950.0),
-        KernelMeasurement(name="fused_mla_kernel", arithmetic_intensity=42.6, achieved_tflops=182.0, achieved_bw_gbs=1820.0),
+        KernelMeasurement(name="flash_attention_v2_fwd", arithmetic_intensity=64.0, achieved_tflops=202.0, achieved_bw_gbs=3156.0),
+        KernelMeasurement(name="flash_attention_v3_hopper", arithmetic_intensity=85.3, achieved_tflops=278.0, achieved_bw_gbs=3259.0),
+        KernelMeasurement(name="fused_online_softmax", arithmetic_intensity=2.0, achieved_tflops=3.8, achieved_bw_gbs=1900.0),
+        KernelMeasurement(name="paged_attention_fp8", arithmetic_intensity=16.0, achieved_tflops=48.5, achieved_bw_gbs=3031.0),
+        KernelMeasurement(name="fused_mla_kernel", arithmetic_intensity=42.6, achieved_tflops=135.0, achieved_bw_gbs=3169.0),
     ]
 
     print(generate_ascii_roofline(specs, sample_measurements, args.precision))

@@ -22,6 +22,7 @@
 // ============================================================================
 
 template <typename T_OUT, typename T_Q, int PAGE_SIZE = 16, int HEAD_DIM = 64, int NUM_THREADS = 128>
+__launch_bounds__(NUM_THREADS, 4)
 __global__ void fp8_paged_attention_kernel(
     const T_Q* __restrict__ query,             // [num_seqs, num_heads, HEAD_DIM]
     const int8_t* __restrict__ key_cache_fp8,   // [num_blocks, num_heads, HEAD_DIM, PAGE_SIZE]
@@ -90,16 +91,17 @@ __global__ void fp8_paged_attention_kernel(
         const int8_t* k_block = key_cache_fp8 + kv_head_offset;
         const int8_t* v_block = value_cache_fp8 + kv_head_offset;
 
+        const float effective_scale = softmax_scale * current_k_scale;
+
         // Compute Q * K_dequant^T
         for (int tok = tid; tok < PAGE_SIZE; tok += NUM_THREADS) {
             if (tok < valid_tokens_in_page) {
                 float dot = 0.0f;
                 #pragma unroll 8
                 for (int d = 0; d < HEAD_DIM; ++d) {
-                    float k_dequant = static_cast<float>(k_block[d * PAGE_SIZE + tok]) * current_k_scale;
-                    dot += s_query[d] * k_dequant;
+                    dot += s_query[d] * static_cast<float>(k_block[d * PAGE_SIZE + tok]);
                 }
-                s_logits[tok] = dot * softmax_scale;
+                s_logits[tok] = dot * effective_scale;
             } else {
                 s_logits[tok] = -CUDART_INF_F;
             }
@@ -130,10 +132,9 @@ __global__ void fp8_paged_attention_kernel(
             float pv = 0.0f;
             #pragma unroll 8
             for (int tok = 0; tok < valid_tokens_in_page; ++tok) {
-                float v_dequant = static_cast<float>(v_block[d * PAGE_SIZE + tok]) * current_v_scale;
-                pv += s_logits[tok] * v_dequant;
+                pv += s_logits[tok] * static_cast<float>(v_block[d * PAGE_SIZE + tok]);
             }
-            acc_out[d] = alpha * acc_out[d] + pv;
+            acc_out[d] = alpha * acc_out[d] + (pv * current_v_scale);
         }
 
         m_i = m_new;

@@ -18,6 +18,7 @@
 // ============================================================================
 
 template <typename T, int PAGE_SIZE = 16, int HEAD_DIM = 64, int NUM_THREADS = 128>
+__launch_bounds__(NUM_THREADS, 4)
 __global__ void paged_attention_kernel(
     const T* __restrict__ query,            // [num_seqs, num_heads, HEAD_DIM]
     const T* __restrict__ key_cache,        // [num_blocks, num_heads, HEAD_DIM, PAGE_SIZE]

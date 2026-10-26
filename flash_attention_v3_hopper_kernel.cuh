@@ -1,6 +1,7 @@
 #pragma once
 #include "cuda_compat.h"
 #include "tile_ir.cuh"
+#include "autotune.cuh"
 #include <cstdint>
 #include <algorithm>
 
@@ -21,7 +22,9 @@
 // 4. In-Register Online Softmax for numerical preservation.
 // ============================================================================
 
-template <typename T, int Br = 64, int Bc = 64, int D = 64, int NUM_STAGES = 2>
+template <typename T, int Br = 64, int Bc = 64, int D = 64, int NUM_STAGES = 2, int NUM_THREADS = 128>
+CLUSTER_DIMS(2, 1, 1)
+__launch_bounds__(NUM_THREADS, 2)
 __global__ void flash_attention_v3_hopper_kernel(
     const T* __restrict__ Q,          // [batch, num_heads, seq_len, D]
     const T* __restrict__ K,          // [batch, num_heads, seq_len, D]
@@ -38,7 +41,7 @@ __global__ void flash_attention_v3_hopper_kernel(
     const int warp_id = tid / 32;
     const int lane_id = tid % 32;
 
-    constexpr int NUM_THREADS = 128; // 4 Warps: Warp 0 Producer, Warps 1..3 Consumers
+    // Dynamic threads from template: Warp 0 Producer, Warps 1..(NUM_THREADS/32 - 1) Consumers
     constexpr int PRODUCER_WARP = 0;
 
     const size_t bh_offset = (static_cast<size_t>(batch_idx) * gridDim.y + head_idx) * (static_cast<size_t>(seq_len) * D);
@@ -116,11 +119,16 @@ __global__ void flash_attention_v3_hopper_kernel(
                 const int cur_kv_row = kv_col_start + r;
 
                 if (cur_kv_row < seq_len) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && !defined(__CUDACC_RTC__)
+                    cp_async_16(&s_K_data[stage][idx], &k_ptr[static_cast<size_t>(cur_kv_row) * D + c]);
+                    cp_async_16(&s_V_data[stage][idx], &v_ptr[static_cast<size_t>(cur_kv_row) * D + c]);
+#else
                     #pragma unroll
                     for (int k = 0; k < 4; ++k) {
                         s_K_stage(r, c + k) = to_float(k_ptr[static_cast<size_t>(cur_kv_row) * D + (c + k)]);
                         s_V_stage(r, c + k) = to_float(v_ptr[static_cast<size_t>(cur_kv_row) * D + (c + k)]);
                     }
+#endif
                 } else {
                     #pragma unroll
                     for (int k = 0; k < 4; ++k) {
@@ -141,65 +149,79 @@ __global__ void flash_attention_v3_hopper_kernel(
             auto s_K_stage = tile_ir::make_row_major_tensor<Bc, D>(s_K_data[stage]);
             auto s_V_stage = tile_ir::make_row_major_tensor<Bc, D>(s_V_data[stage]);
 
-            const int consumer_tid = tid - 32; // 0..95
-            constexpr int NUM_CONSUMER_THREADS = 96;
+            const int local_r = tid - 32; // 0..95
+            if (local_r < Br) {
+                const int global_q_row = q_row_start + local_r;
+                if (global_q_row < seq_len) {
+                    float S_row[Bc];
+                    float block_max = -CUDART_INF_F;
 
-            for (int r = consumer_tid; r < Br; r += NUM_CONSUMER_THREADS) {
-                const int global_q_row = q_row_start + r;
-                if (global_q_row >= seq_len) continue;
+                    const bool is_fully_unmasked = (!is_causal || (kv_col_start + Bc <= global_q_row)) && (kv_col_start + Bc <= seq_len);
 
-                float S_row[Bc];
-                float block_max = -CUDART_INF_F;
-
-                #pragma unroll 4
-                for (int j = 0; j < Bc; ++j) {
-                    const int global_k_col = kv_col_start + j;
-                    if (global_k_col >= seq_len || (is_causal && global_k_col > global_q_row)) {
-                        S_row[j] = -CUDART_INF_F;
-                    } else {
-                        float dot = 0.0f;
-                        #pragma unroll 8
-                        for (int d = 0; d < D; ++d) {
-                            dot += s_Q(r, d) * s_K_stage(j, d);
+                    if (is_fully_unmasked) {
+                        #pragma unroll 4
+                        for (int j = 0; j < Bc; ++j) {
+                            float dot = 0.0f;
+                            #pragma unroll 8
+                            for (int d = 0; d < D; ++d) {
+                                dot += s_Q(local_r, d) * s_K_stage(j, d);
+                            }
+                            float scaled = dot * softmax_scale;
+                            S_row[j] = scaled;
+                            block_max = fmaxf(block_max, scaled);
                         }
-                        float scaled = dot * softmax_scale;
-                        S_row[j] = scaled;
-                        block_max = fmaxf(block_max, scaled);
-                    }
-                }
-
-                // Online Softmax in-register update
-                const float m_new = fmaxf(m_i, block_max);
-                const float alpha = (m_i == -CUDART_INF_F) ? 0.0f : __expf(m_i - m_new);
-
-                float block_sum_exp = 0.0f;
-                float P_row[Bc];
-                #pragma unroll 4
-                for (int j = 0; j < Bc; ++j) {
-                    if (S_row[j] == -CUDART_INF_F) {
-                        P_row[j] = 0.0f;
                     } else {
-                        float p = __expf(S_row[j] - m_new);
-                        P_row[j] = p;
-                        block_sum_exp += p;
+                        #pragma unroll 4
+                        for (int j = 0; j < Bc; ++j) {
+                            const int global_k_col = kv_col_start + j;
+                            if (global_k_col >= seq_len || (is_causal && global_k_col > global_q_row)) {
+                                S_row[j] = -CUDART_INF_F;
+                            } else {
+                                float dot = 0.0f;
+                                #pragma unroll 8
+                                for (int d = 0; d < D; ++d) {
+                                    dot += s_Q(local_r, d) * s_K_stage(j, d);
+                                }
+                                float scaled = dot * softmax_scale;
+                                S_row[j] = scaled;
+                                block_max = fmaxf(block_max, scaled);
+                            }
+                        }
                     }
-                }
 
-                const float l_new = alpha * l_i + block_sum_exp;
+                    // Online Softmax in-register update
+                    const float m_new = fmaxf(m_i, block_max);
+                    const float alpha = (m_i == -CUDART_INF_F) ? 0.0f : __expf(m_i - m_new);
 
-                // Accumulate V tile into register accumulator
-                #pragma unroll 4
-                for (int d = 0; d < D; ++d) {
-                    float pv = 0.0f;
-                    #pragma unroll 8
+                    float block_sum_exp = 0.0f;
+                    float P_row[Bc];
+                    #pragma unroll 4
                     for (int j = 0; j < Bc; ++j) {
-                        pv += P_row[j] * s_V_stage(j, d);
+                        if (S_row[j] == -CUDART_INF_F) {
+                            P_row[j] = 0.0f;
+                        } else {
+                            float p = __expf(S_row[j] - m_new);
+                            P_row[j] = p;
+                            block_sum_exp += p;
+                        }
                     }
-                    acc_O[d] = alpha * acc_O[d] + pv;
-                }
 
-                m_i = m_new;
-                l_i = l_new;
+                    const float l_new = alpha * l_i + block_sum_exp;
+
+                    // Accumulate V tile into register accumulator
+                    #pragma unroll 4
+                    for (int d = 0; d < D; ++d) {
+                        float pv = 0.0f;
+                        #pragma unroll 8
+                        for (int j = 0; j < Bc; ++j) {
+                            pv += P_row[j] * s_V_stage(j, d);
+                        }
+                        acc_O[d] = alpha * acc_O[d] + pv;
+                    }
+
+                    m_i = m_new;
+                    l_i = l_new;
+                }
             }
         }
 
@@ -213,7 +235,7 @@ __global__ void flash_attention_v3_hopper_kernel(
     // 4. Final normalization and store output: O = acc_O / l_i
     if (warp_id != PRODUCER_WARP) {
         const int consumer_tid = tid - 32;
-        constexpr int NUM_CONSUMER_THREADS = 96;
+        const int NUM_CONSUMER_THREADS = NUM_THREADS - 32;
 
         for (int r = consumer_tid; r < Br; r += NUM_CONSUMER_THREADS) {
             const int global_q_row = q_row_start + r;
@@ -229,7 +251,7 @@ __global__ void flash_attention_v3_hopper_kernel(
     }
 }
 
-// Host Dispatcher
+// Host Dispatcher with Hopper TMA & Dynamic Autotuning
 template <typename T>
 void dispatch_flash_attention_v3_hopper(
     const T* q,
@@ -244,23 +266,61 @@ void dispatch_flash_attention_v3_hopper(
     bool is_causal,
     cudaStream_t stream = nullptr)
 {
-    constexpr int Br = 64;
-    constexpr int Bc = 64;
-    constexpr int NUM_THREADS = 128; // 1 Producer Warp + 3 Consumer Warps
+    auto policy = autotune::select_attention_tile_policy(seq_len, head_dim, num_heads, batch_size);
 
-    const int num_q_blocks = (seq_len + Br - 1) / Br;
-    dim3 grid(num_q_blocks, num_heads, batch_size);
-    dim3 block(NUM_THREADS);
-
-    if (head_dim == 64) {
-        CUDA_KERNEL_LAUNCH(
-            (flash_attention_v3_hopper_kernel<T, Br, Bc, 64, 2>),
-            grid, block, 0, stream,
-            q, k, v, o, seq_len, softmax_scale, is_causal);
-    } else if (head_dim == 128) {
-        CUDA_KERNEL_LAUNCH(
-            (flash_attention_v3_hopper_kernel<T, Br, Bc, 128, 2>),
-            grid, block, 0, stream,
-            q, k, v, o, seq_len, softmax_scale, is_causal);
+    if (policy.Br == 32) {
+        constexpr int Br = 32;
+        constexpr int Bc = 64;
+        constexpr int NUM_THREADS = 64;
+        const int num_q_blocks = (seq_len + Br - 1) / Br;
+        dim3 grid(num_q_blocks, num_heads, batch_size);
+        dim3 block(NUM_THREADS);
+        if (head_dim == 64) {
+            CUDA_KERNEL_LAUNCH(
+                (flash_attention_v3_hopper_kernel<T, Br, Bc, 64, 2, NUM_THREADS>),
+                grid, block, 0, stream,
+                q, k, v, o, seq_len, softmax_scale, is_causal);
+        } else {
+            CUDA_KERNEL_LAUNCH(
+                (flash_attention_v3_hopper_kernel<T, Br, Bc, 128, 2, NUM_THREADS>),
+                grid, block, 0, stream,
+                q, k, v, o, seq_len, softmax_scale, is_causal);
+        }
+    } else if (policy.Br == 128) {
+        constexpr int Br = 128;
+        constexpr int Bc = 64;
+        constexpr int NUM_THREADS = 256;
+        const int num_q_blocks = (seq_len + Br - 1) / Br;
+        dim3 grid(num_q_blocks, num_heads, batch_size);
+        dim3 block(NUM_THREADS);
+        if (head_dim == 64) {
+            CUDA_KERNEL_LAUNCH(
+                (flash_attention_v3_hopper_kernel<T, Br, Bc, 64, 3, NUM_THREADS>),
+                grid, block, 0, stream,
+                q, k, v, o, seq_len, softmax_scale, is_causal);
+        } else {
+            CUDA_KERNEL_LAUNCH(
+                (flash_attention_v3_hopper_kernel<T, Br, Bc, 128, 3, NUM_THREADS>),
+                grid, block, 0, stream,
+                q, k, v, o, seq_len, softmax_scale, is_causal);
+        }
+    } else {
+        constexpr int Br = 64;
+        constexpr int Bc = 64;
+        constexpr int NUM_THREADS = 128;
+        const int num_q_blocks = (seq_len + Br - 1) / Br;
+        dim3 grid(num_q_blocks, num_heads, batch_size);
+        dim3 block(NUM_THREADS);
+        if (head_dim == 64) {
+            CUDA_KERNEL_LAUNCH(
+                (flash_attention_v3_hopper_kernel<T, Br, Bc, 64, 2, NUM_THREADS>),
+                grid, block, 0, stream,
+                q, k, v, o, seq_len, softmax_scale, is_causal);
+        } else {
+            CUDA_KERNEL_LAUNCH(
+                (flash_attention_v3_hopper_kernel<T, Br, Bc, 128, 2, NUM_THREADS>),
+                grid, block, 0, stream,
+                q, k, v, o, seq_len, softmax_scale, is_causal);
+        }
     }
 }

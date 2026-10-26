@@ -20,6 +20,7 @@
 // ============================================================================
 
 template <typename T, int HIDDEN_DIM = 256, int NUM_Q_HEADS = 4, int NUM_KV_HEADS = 2, int HEAD_DIM = 64>
+__launch_bounds__(128, 2)
 __global__ void fused_llama_megablock_kernel(
     const T* __restrict__ X,                    // [batch, seq_len, HIDDEN_DIM]
     const float* __restrict__ rms_weight1,      // [HIDDEN_DIM]

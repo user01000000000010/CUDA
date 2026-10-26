@@ -120,7 +120,9 @@ print(f"[setup.py] Build dir : {build_dir}")
 print("=" * 72)
 
 setup(
-    name="fused_online_softmax_cuda",
+    name="cuda_llm",
+    version="0.2.0",
+    packages=["cuda_llm"],
     ext_modules=[
         CUDAExtension(
             name="fused_online_softmax_cuda",
